@@ -1,5 +1,6 @@
 """
-Análise das leituras da estação meteorológica (DHT + BMP + sensor de chuva).
+Análise das leituras da estação meteorológica (Raspberry Pi Pico W + DHT11 + BMP280 +
+sensor de chuva).
 
 Perguntas respondidas, para cada dia presente na base:
   1 - Qual foi o período mais úmido do dia?
@@ -13,16 +14,28 @@ Uso:
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 ARQUIVO_PADRAO = Path(__file__).with_name("leituras_202611152221.csv")
 
-# Sensor de chuva analógico (FC-37 / YL-83) lido por ADC de 12 bits (ESP32):
-# 4095 = placa totalmente seca, perto de 0 = placa encharcada.
-ADC_MAX = 4095
-# Acima de 50% de molhamento da placa a leitura é considerada "chovendo".
-LIMIAR_CHUVA_PCT = 50
+# Faixas de operação de cada sensor, conforme a especificação do projeto.
+# Leituras fora dessas faixas não são fisicamente possíveis para o sensor.
+FAIXAS_SENSORES = {
+    "dht_umidade": (20, 95),          # DHT11, %
+    "dht_temp": (0, 50),              # DHT11, °C
+    "bmp_temp": (-40, 85),            # BMP280, °C
+    "bmp_pressao": (30_000, 110_000), # BMP280, Pa
+    "chuva_bruta": (0, 65_535),       # ADC do Pico (GP28), read_u16()
+}
+COLUNAS_ANALISADAS = ["dht_umidade", "dht_temp", "bmp_temp", "chuva_bruta"]
+
+# Sensor de chuva no ADC2 (GP28): 0 V (~300 contagens, ruído do ADC) = placa seca,
+# 3,3 V (65535) = placa submersa.
+CHUVA_SECO = 300
+CHUVA_SUBMERSO = 65_535
+# O ruído do ADC com a placa seca fica entre ~250 e ~470 contagens na base. Acima de
+# 500 a placa tem água, e a leitura é considerada "chovendo".
+LIMIAR_AGUA = 500
 
 PERIODOS = {
     "Madrugada (00h-06h)": range(0, 6),
@@ -32,12 +45,26 @@ PERIODOS = {
 }
 
 
+def validar_faixas(df: pd.DataFrame) -> pd.DataFrame:
+    """Conta as leituras fora da faixa de cada sensor e remove as das colunas usadas."""
+    print("\nValidação das faixas dos sensores:")
+    fora_total = pd.Series(False, index=df.index)
+    for coluna, (minimo, maximo) in FAIXAS_SENSORES.items():
+        fora = ~df[coluna].between(minimo, maximo)
+        situacao = "usada" if coluna in COLUNAS_ANALISADAS else "desconsiderada"
+        print(f"   {coluna:<12} faixa {minimo:>7,} a {maximo:>7,}  ->  "
+              f"{fora.mean() * 100:5.1f} % fora ({situacao})".replace(",", "."))
+        if coluna in COLUNAS_ANALISADAS:
+            fora_total |= fora
+    return df[~fora_total]
+
+
 def carregar_dados(caminho: Path) -> pd.DataFrame:
     df = pd.read_csv(caminho, parse_dates=["data_hora"])
 
-    # Limpeza: remove linhas duplicadas e leituras impossíveis do ADC
+    # Limpeza: remove linhas duplicadas e leituras fora da faixa dos sensores
     df = df.drop_duplicates()
-    df = df[df["chuva_bruta"].between(0, ADC_MAX)]
+    df = validar_faixas(df)
     df = df.sort_values("data_hora").reset_index(drop=True)
 
     df["dia"] = df["data_hora"].dt.date
@@ -46,9 +73,10 @@ def carregar_dados(caminho: Path) -> pd.DataFrame:
         {h: nome for nome, horas in PERIODOS.items() for h in horas}
     )
 
-    # Converte a leitura bruta em % de molhamento da placa (0 = seco, 100 = encharcado)
-    df["chuva_pct"] = ((ADC_MAX - df["chuva_bruta"]) / ADC_MAX * 100).clip(0, 100)
-    df["chovendo"] = df["chuva_pct"] >= LIMIAR_CHUVA_PCT
+    # Intensidade = % da escala do sensor (0 = seco, 100 = submerso)
+    df["chuva_pct"] = ((df["chuva_bruta"] - CHUVA_SECO)
+                       / (CHUVA_SUBMERSO - CHUVA_SECO) * 100).clip(0, 100)
+    df["chovendo"] = df["chuva_bruta"] > LIMIAR_AGUA
     return df
 
 
@@ -62,16 +90,16 @@ def horario_mais_quente(dia: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return por_hora, leitura_max
 
 
-def probabilidade_chuva(dia: pd.DataFrame) -> tuple[float, float, pd.Series]:
-    # Probabilidade = fração das leituras do dia em que o sensor indicou chuva
+def probabilidade_chuva(dia: pd.DataFrame) -> tuple[float, pd.Series, pd.Series]:
+    # Probabilidade = fração das leituras do dia em que havia água na placa
     prob_dia = dia["chovendo"].mean() * 100
     prob_por_periodo = dia.groupby("periodo")["chovendo"].mean() * 100
-    molhamento_medio = dia["chuva_pct"].mean()
-    return prob_dia, molhamento_medio, prob_por_periodo
+    leitura_max = dia.loc[dia["chuva_bruta"].idxmax()]
+    return prob_dia, prob_por_periodo, leitura_max
 
 
 def relatorio(df: pd.DataFrame) -> None:
-    print(f"Leituras válidas: {len(df):,}".replace(",", "."))
+    print(f"\nLeituras válidas: {len(df):,}".replace(",", "."))
     print(f"Intervalo: {df['data_hora'].min()}  ->  {df['data_hora'].max()}")
 
     for data, dia in df.groupby("dia"):
@@ -98,18 +126,20 @@ def relatorio(df: pd.DataFrame) -> None:
               f"com {leitura_max['temperatura_media']:.2f} °C")
 
         # 3 - Probabilidade de chuva
-        prob_dia, molhamento, prob_periodo = probabilidade_chuva(dia)
-        print("\n3) Probabilidade de chuva")
+        prob_dia, prob_periodo, chuva_max = probabilidade_chuva(dia)
+        com_agua = dia.loc[dia["chovendo"], "chuva_pct"]
+        print("\n3) Probabilidade de chuva (água detectada na placa)")
         for periodo, valor in prob_periodo.reindex(PERIODOS).dropna().items():
             print(f"   {periodo:<22} {valor:6.1f} %")
         print(f"   >> Probabilidade de chuva no dia: {prob_dia:.1f} %")
-        print(f"      (molhamento médio do sensor: {molhamento:.1f} %)")
+        if not com_agua.empty:
+            print(f"      (intensidade mediana com água: {com_agua.median():.1f} % da escala; "
+                  f"pico de {chuva_max['chuva_pct']:.1f} % às {chuva_max['data_hora']:%H:%M:%S})")
 
 
 def main() -> None:
     caminho = Path(sys.argv[1]) if len(sys.argv) > 1 else ARQUIVO_PADRAO
     df = carregar_dados(caminho)
-    pd.set_option("display.width", 120)
     relatorio(df)
 
 
